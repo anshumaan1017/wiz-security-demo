@@ -1,15 +1,14 @@
 # Intentionally vulnerable Python dependencies for Wiz SCA scanning
-# Each pin below has one or more public CVEs
 
-Django==2.2.0              # CVE-2019-19844, CVE-2020-7471, etc.
-Flask==0.12.2              # CVE-2018-1000656
-Jinja2==2.10               # CVE-2019-10906, CVE-2020-28493
-PyYAML==5.1                # CVE-2020-1747, CVE-2020-14343
-requests==2.19.1           # CVE-2018-18074
-urllib3==1.24.1            # CVE-2019-11324, CVE-2020-26137
-cryptography==2.3          # CVE-2018-10903
-Pillow==6.2.0              # CVE-2019-16865, CVE-2020-5312, multiple
-numpy==1.16.0              # CVE-2019-6446
-lxml==4.3.0                # CVE-2020-27783, CVE-2021-28957
-paramiko==2.4.1            # CVE-2018-1000805
-Werkzeug==0.15.0           # CVE-2019-14806, CVE-2020-28724
+Django==2.2.0
+Flask==0.12.2
+Jinja2==2.10
+PyYAML==5.1
+requests==2.19.1
+urllib3==1.23          # ← changed from 1.24.1 (also has CVEs, compatible with requests 2.19.1)
+cryptography==2.3
+Pillow==6.2.0
+numpy==1.16.0
+lxml==4.3.0
+paramiko==2.4.1
+Werkzeug==0.15.0

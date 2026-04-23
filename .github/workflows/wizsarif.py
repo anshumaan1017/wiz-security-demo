@@ -16,6 +16,7 @@ ANSI = {
     "RESET":    "\033[0m",
 }
 
+# Emoji indicators for the GitHub Step Summary markdown view
 EMOJI = {
     "CRITICAL": "🔴",
     "HIGH":     "🟠",
@@ -30,6 +31,7 @@ SEVERITY_ORDER = {
     "INFORMATIONAL": 4, "UNKNOWN": 5,
 }
 
+# CVSS-style numeric severity GitHub uses for proper severity badges
 SECURITY_SEVERITY = {
     "CRITICAL": "9.5",
     "HIGH":     "8.0",
@@ -39,6 +41,7 @@ SECURITY_SEVERITY = {
     "UNKNOWN":  "0.0",
 }
 
+# Map our severity to SARIF level (what GitHub displays as Error/Warning/Note)
 LEVEL_MAP = {
     "CRITICAL": "error",
     "HIGH":     "error",
@@ -147,13 +150,13 @@ def get_severity_for_result(result, rule_map):
     if rp_sev and rp_sev in SECURITY_SEVERITY:
         return rp_sev, fields
 
-    # 3c. rule.properties.problem.severity (common in some tools)
+    # 3c. rule.properties.problem.severity
     problem = rule_props.get("problem") or {}
     problem_sev = str(problem.get("severity", "")).upper()
     if problem_sev and problem_sev in SECURITY_SEVERITY:
         return problem_sev, fields
 
-    # 4. Fall back to SARIF level from rule.defaultConfiguration or result.level
+    # 4. Fall back to SARIF level
     default_cfg = rule.get("defaultConfiguration") or {}
     level = (result.get("level") or default_cfg.get("level") or "").lower()
     if level in SARIF_LEVEL_TO_SEVERITY:
@@ -201,7 +204,6 @@ def extract_rows(sarif):
             rule_id = result.get("ruleId", "N/A")
             severity, fields = get_severity_for_result(result, rule_map)
 
-            # Try rule.shortDescription / fullDescription / name for IaC findings
             rule = rule_map.get(rule_id, {})
             rule_short = (rule.get("shortDescription") or {}).get("text", "")
             rule_name = rule.get("name") or ""
@@ -225,7 +227,7 @@ def extract_rows(sarif):
 
             status = f"fixed in {fixed}" if fixed != "N/A" else "no fix"
 
-            # For IaC: rule_id is a UUID, replace with friendlier label
+            # For IaC findings whose ruleId is a UUID, use rule.name if present
             display_rule = rule_id
             if rule_name and len(rule_id) > 30 and "-" in rule_id:
                 display_rule = rule_name
@@ -313,19 +315,18 @@ def write_summary(title, rows, counts):
             f.write(tabulate(md_rows, headers=headers, tablefmt="github"))
             f.write("\n")
 
+
 def _extract_layer_info(obj):
     """
-    Returns (layer_id, instruction) from a package object's layerMetadata.
-    Returns (None, None) if nothing usable is found.
+    Returns (layer_id, instruction, index, is_base_layer) from layerMetadata.
     """
     if not isinstance(obj, dict):
-        return None, None
+        return None, "", None, False
 
     meta = obj.get("layerMetadata")
     if not isinstance(meta, dict):
-        return None, None
+        return None, "", None, False
 
-    # Try common field names for the layer ID/digest
     layer_id = (
         meta.get("id")
         or meta.get("layerId")
@@ -336,9 +337,10 @@ def _extract_layer_info(obj):
         or meta.get("hash")
     )
 
-    # Try common field names for the Dockerfile instruction
+    # Wiz uses "details" to hold the Dockerfile-instruction-like string
     instruction = (
-        meta.get("createdBy")
+        meta.get("details")
+        or meta.get("createdBy")
         or meta.get("instruction")
         or meta.get("command")
         or meta.get("cmd")
@@ -346,12 +348,16 @@ def _extract_layer_info(obj):
         or ""
     )
 
-    # Also check for an ordering index (some wizcli versions have this)
     index = meta.get("index") or meta.get("layerIndex") or meta.get("order")
+    is_base = bool(meta.get("isBaseLayer", False))
 
-    return (str(layer_id) if layer_id else None,
-            str(instruction) if instruction else "",
-            index)
+    return (
+        str(layer_id) if layer_id else None,
+        str(instruction) if instruction else "",
+        index,
+        is_base,
+    )
+
 
 def print_layer_report(json_path="image-layers.json"):
     """Group findings by layerMetadata and print a per-layer report."""
@@ -376,20 +382,10 @@ def print_layer_report(json_path="image-layers.json"):
             print(f"(Layer report: no findings in result. Keys = {list(result.keys())})")
             return
 
-        # ONE-TIME DEBUG: show what layerMetadata actually looks like
-        sample_meta = None
-        for p in all_findings:
-            if isinstance(p.get("layerMetadata"), dict):
-                sample_meta = p["layerMetadata"]
-                break
-        if sample_meta:
-            print(f"(Layer report: sample layerMetadata keys = {list(sample_meta.keys())})")
-            print(f"(Layer report: sample layerMetadata = {json.dumps(sample_meta, default=str)[:400]})")
-
-        # Group findings by (layer_id, instruction, index)
+        # Group findings by (layer_id, instruction)
         layers = {}
         for pkg in all_findings:
-            layer_id, instruction, index = _extract_layer_info(pkg)
+            layer_id, instruction, index, is_base = _extract_layer_info(pkg)
             if not layer_id:
                 layer_id = "unknown"
 
@@ -399,6 +395,7 @@ def print_layer_report(json_path="image-layers.json"):
                 layers.setdefault(key, {
                     "findings": [],
                     "index": index if index is not None else 999,
+                    "is_base": is_base,
                 })
                 layers[key]["findings"].append({
                     "cve": v.get("name", "N/A"),
@@ -424,20 +421,29 @@ def print_layer_report(json_path="image-layers.json"):
 
         for idx, ((layer_id, instruction), payload) in enumerate(sorted_layers):
             findings = payload["findings"]
+            is_base = payload.get("is_base", False)
+
             sev_counts = {}
             for f in findings:
                 sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
 
-            layer_short = layer_id[:20] if layer_id != "unknown" else "unknown"
-            print(f"\nLayer #{idx + 1}  [{layer_short}]")
+            base_tag = " [BASE IMAGE]" if is_base else ""
+            print(f"\nLayer #{idx + 1}{base_tag}")
+            print(f"  Digest:      {layer_id}")
             if instruction:
-                # Trim long instructions (RUN commands can be very long)
-                print(f"  Instruction: {instruction[:140]}")
+                wrapped = textwrap.fill(
+                    instruction,
+                    width=140,
+                    initial_indent="  Instruction: ",
+                    subsequent_indent="               ",
+                )
+                print(wrapped)
+
             sev_summary = " | ".join(
                 f"{ANSI.get(s, '')}{s}: {sev_counts[s]}{ANSI['RESET']}"
                 for s in SEVERITY_ORDER if sev_counts.get(s)
             )
-            print(f"  Findings: {len(findings)}  ({sev_summary})")
+            print(f"  Findings:    {len(findings)}  ({sev_summary})")
 
             findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 99))
             seen = set()
@@ -474,14 +480,17 @@ def print_layer_report(json_path="image-layers.json"):
                 f.write(f"\n## Per-Layer Vulnerability Report  ({len(sorted_layers)} layers)\n\n")
                 for idx, ((layer_id, instruction), payload) in enumerate(sorted_layers):
                     findings = payload["findings"]
+                    is_base = payload.get("is_base", False)
+
                     sev_counts = {}
                     for fd in findings:
                         sev_counts[fd["severity"]] = sev_counts.get(fd["severity"], 0) + 1
 
-                    layer_short = layer_id[:20] if layer_id != "unknown" else "unknown"
-                    f.write(f"### Layer #{idx + 1} — `{layer_short}`\n\n")
+                    base_tag = " 🏛️ **BASE IMAGE**" if is_base else ""
+                    f.write(f"### Layer #{idx + 1}{base_tag}\n\n")
+                    f.write(f"**Digest:** `{layer_id}`\n\n")
                     if instruction:
-                        f.write(f"**Instruction:** `{instruction[:200]}`\n\n")
+                        f.write(f"**Instruction:** `{instruction}`\n\n")
                     f.write(f"**Findings:** {len(findings)} — " + " | ".join(
                         f"{EMOJI.get(s, '')} {s}: {sev_counts[s]}"
                         for s in SEVERITY_ORDER if sev_counts.get(s)
@@ -517,9 +526,6 @@ def print_layer_report(json_path="image-layers.json"):
         print(traceback.format_exc())
 
 
-
-
-
 def main():
     any_found = False
     for title, path in SARIF_FILES:
@@ -532,13 +538,16 @@ def main():
             with open(path) as f:
                 sarif = json.load(f)
 
+            # Enrich SARIF so GitHub shows proper Critical/High/Medium badges
             sarif = enrich_sarif_with_severity(sarif)
 
+            # Write the enriched SARIF back so the upload step picks it up
             with open(path, "w") as f:
                 json.dump(sarif, f, indent=2)
 
             rows = extract_rows(sarif)
 
+            # Dedupe
             seen = set()
             deduped = []
             for r in rows:
@@ -547,21 +556,24 @@ def main():
                     seen.add(key)
                     deduped.append(r)
 
+            # Keep only top 3 for a clean demo console table
             rows = deduped[:3]
 
             counts = print_report(title, rows)
             write_summary(title, rows, counts)
-             # Per-layer image report — wrapped in try/except so it never crashes
-            try:
-                print_layer_report("image-layers.json")
-            except Exception as e:
-                print(f"\n(Per-layer report outer failure: {e})")
         except Exception as e:
             print(f"\n(Error processing {title}: {e})")
             print(traceback.format_exc())
 
     if not any_found:
         print("No SARIF files found. Did the scan steps run?")
+
+    # Per-layer container image report (from --driver mountWithLayers JSON)
+    try:
+        print_layer_report("image-layers.json")
+    except Exception as e:
+        print(f"\n(Per-layer report outer failure: {e})")
+
 
 if __name__ == "__main__":
     main()

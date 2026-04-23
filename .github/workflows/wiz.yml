@@ -6,7 +6,6 @@ on:
   pull_request:
 
 env:
-  # Force wide output everywhere so tables don't wrap/overlap in Actions log
   COLUMNS: "250"
   TERM: xterm-256color
 
@@ -46,9 +45,8 @@ jobs:
       # === SCA: source dependency scan ===
       - name: Wiz Directory Scan (SCA)
         run: |
-          echo "::group::🔍 Wiz SCA Scan - Verbose Output"
+          echo "::group::🔍 Wiz SCA Scan"
           wizcli dir scan --path . \
-            --log-level debug \
             --output dir.sarif,sarif,vulnerabilities \
             --output dir.txt,human,vulnerabilities
           echo "::endgroup::"
@@ -61,9 +59,8 @@ jobs:
       # === IaC: Dockerfile misconfiguration scan ===
       - name: Wiz Dockerfile Scan (IaC)
         run: |
-          echo "::group::🔍 Wiz IaC Scan - Verbose Output"
+          echo "::group::🔍 Wiz IaC Scan"
           wizcli iac scan --path ./Dockerfile \
-            --log-level debug \
             --output dockerfile.sarif,sarif,misconfigurations \
             --output dockerfile.txt,human,misconfigurations
           echo "::endgroup::"
@@ -84,12 +81,13 @@ jobs:
       - name: Wiz Container Image Scan
         if: success()
         run: |
-          echo "::group::🔍 Wiz Container Image Scan - Verbose Output"
+          echo "::group::🔍 Wiz Container Image Scan"
           wizcli docker scan \
             --image wiz-vuln-demo:${{ github.sha }} \
-            --log-level debug \
+            --driver mountWithLayers \
             --output image.sarif,sarif,vulnerabilities \
-            --output image.txt,human,vulnerabilities
+            --output image.txt,human,vulnerabilities \
+            --output image-layers.json,json,vulnerabilities
           echo "::endgroup::"
 
           echo "::group::📋 Image Findings Table"

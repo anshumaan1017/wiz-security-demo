@@ -313,9 +313,48 @@ def write_summary(title, rows, counts):
             f.write(tabulate(md_rows, headers=headers, tablefmt="github"))
             f.write("\n")
 
+def _extract_layer_info(obj):
+    """
+    Returns (layer_id, instruction) from a package object's layerMetadata.
+    Returns (None, None) if nothing usable is found.
+    """
+    if not isinstance(obj, dict):
+        return None, None
+
+    meta = obj.get("layerMetadata")
+    if not isinstance(meta, dict):
+        return None, None
+
+    # Try common field names for the layer ID/digest
+    layer_id = (
+        meta.get("id")
+        or meta.get("layerId")
+        or meta.get("layerID")
+        or meta.get("digest")
+        or meta.get("layerDigest")
+        or meta.get("sha")
+        or meta.get("hash")
+    )
+
+    # Try common field names for the Dockerfile instruction
+    instruction = (
+        meta.get("createdBy")
+        or meta.get("instruction")
+        or meta.get("command")
+        or meta.get("cmd")
+        or meta.get("layerInstruction")
+        or ""
+    )
+
+    # Also check for an ordering index (some wizcli versions have this)
+    index = meta.get("index") or meta.get("layerIndex") or meta.get("order")
+
+    return (str(layer_id) if layer_id else None,
+            str(instruction) if instruction else "",
+            index)
 
 def print_layer_report(json_path="image-layers.json"):
-    """Print per-layer breakdown. Fails gracefully — never crash the whole script."""
+    """Group findings by layerMetadata and print a per-layer report."""
     if not os.path.exists(json_path):
         print(f"\n(Skipping per-layer report: {json_path} not found)")
         return
@@ -328,62 +367,72 @@ def print_layer_report(json_path="image-layers.json"):
         return
 
     try:
-        # Debug: show top-level structure
-        top_keys = list(data.keys()) if isinstance(data, dict) else []
-        print(f"\n(Layer report: JSON top-level keys = {top_keys})")
-
-        result = data.get("result") or data.get("scan") or data or {}
-        if not isinstance(result, dict):
-            print("(Layer report: unexpected JSON structure, skipping)")
-            return
-
-        os_packages = result.get("osPackages", []) or []
-        libraries = result.get("libraries", []) or []
-        all_findings = os_packages + libraries
+        result = data.get("result") or {}
+        all_findings = []
+        for key in ("osPackages", "libraries", "applications"):
+            all_findings.extend(result.get(key, []) or [])
 
         if not all_findings:
-            # Some wizcli versions put data in different keys
-            print(f"(Layer report: no osPackages/libraries keys found. result keys = {list(result.keys())})")
+            print(f"(Layer report: no findings in result. Keys = {list(result.keys())})")
             return
 
+        # ONE-TIME DEBUG: show what layerMetadata actually looks like
+        sample_meta = None
+        for p in all_findings:
+            if isinstance(p.get("layerMetadata"), dict):
+                sample_meta = p["layerMetadata"]
+                break
+        if sample_meta:
+            print(f"(Layer report: sample layerMetadata keys = {list(sample_meta.keys())})")
+            print(f"(Layer report: sample layerMetadata = {json.dumps(sample_meta, default=str)[:400]})")
+
+        # Group findings by (layer_id, instruction, index)
         layers = {}
         for pkg in all_findings:
+            layer_id, instruction, index = _extract_layer_info(pkg)
+            if not layer_id:
+                layer_id = "unknown"
+
             vulns = pkg.get("vulnerabilities", []) or []
             for v in vulns:
-                layer_key = (v.get("layerID") or v.get("layerDigest")
-                             or pkg.get("layerID") or pkg.get("layerDigest")
-                             or "unknown")
-                layer_instruction = (v.get("layerInstruction")
-                                     or pkg.get("layerInstruction") or "")
-                key = (layer_key, layer_instruction)
-                layers.setdefault(key, []).append({
+                key = (layer_id, instruction)
+                layers.setdefault(key, {
+                    "findings": [],
+                    "index": index if index is not None else 999,
+                })
+                layers[key]["findings"].append({
                     "cve": v.get("name", "N/A"),
                     "severity": (v.get("severity") or "UNKNOWN").upper(),
                     "component": pkg.get("name", "N/A"),
                     "version": pkg.get("version", "N/A"),
-                    "fixed": v.get("fixedVersion", "N/A"),
+                    "fixed": v.get("fixedVersion") or "no fix",
                 })
 
         if not layers:
-            print("(Layer report: no layer-tagged vulnerabilities found)")
+            print("(Layer report: no vulnerabilities found)")
             return
 
+        # Sort by layer index if we have it; otherwise by layer_id string
+        def sort_key(item):
+            (layer_id, _), payload = item
+            return (payload["index"], str(layer_id))
+
+        sorted_layers = sorted(layers.items(), key=sort_key)
+
         bar = "=" * 100
-        print(f"\n{bar}\nPer-Layer Vulnerability Report\n{bar}")
+        print(f"\n{bar}\nPer-Layer Vulnerability Report  ({len(sorted_layers)} layers)\n{bar}")
 
-        sorted_layers = sorted(layers.items(), key=lambda x: str(x[0][0]))
-
-        for idx, ((layer_key, instruction), findings) in enumerate(sorted_layers):
+        for idx, ((layer_id, instruction), payload) in enumerate(sorted_layers):
+            findings = payload["findings"]
             sev_counts = {}
             for f in findings:
                 sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
 
-            layer_short = str(layer_key)[:16] if layer_key != "unknown" else "unknown"
-            header = f"\nLayer #{idx + 1}  [{layer_short}]"
+            layer_short = layer_id[:20] if layer_id != "unknown" else "unknown"
+            print(f"\nLayer #{idx + 1}  [{layer_short}]")
             if instruction:
-                header += f"\n  Instruction: {instruction[:120]}"
-            print(header)
-
+                # Trim long instructions (RUN commands can be very long)
+                print(f"  Instruction: {instruction[:140]}")
             sev_summary = " | ".join(
                 f"{ANSI.get(s, '')}{s}: {sev_counts[s]}{ANSI['RESET']}"
                 for s in SEVERITY_ORDER if sev_counts.get(s)
@@ -394,9 +443,9 @@ def print_layer_report(json_path="image-layers.json"):
             seen = set()
             deduped = []
             for f in findings:
-                key = (f["component"], f["cve"])
-                if key not in seen:
-                    seen.add(key)
+                k = (f["component"], f["cve"])
+                if k not in seen:
+                    seen.add(k)
                     deduped.append(f)
             top = deduped[:5]
 
@@ -404,9 +453,9 @@ def print_layer_report(json_path="image-layers.json"):
                 [
                     wrap(f["cve"], 16),
                     f"{ANSI.get(f['severity'], '')}{f['severity']}{ANSI['RESET']}",
-                    wrap(f["component"], 22),
-                    wrap(f["version"], 14),
-                    wrap(f["fixed"], 14),
+                    wrap(f["component"], 24),
+                    wrap(f["version"], 16),
+                    wrap(f["fixed"], 16),
                 ]
                 for f in top
             ]
@@ -422,16 +471,17 @@ def print_layer_report(json_path="image-layers.json"):
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
         if summary_path:
             with open(summary_path, "a") as f:
-                f.write("\n## Per-Layer Vulnerability Report\n\n")
-                for idx, ((layer_key, instruction), findings) in enumerate(sorted_layers):
+                f.write(f"\n## Per-Layer Vulnerability Report  ({len(sorted_layers)} layers)\n\n")
+                for idx, ((layer_id, instruction), payload) in enumerate(sorted_layers):
+                    findings = payload["findings"]
                     sev_counts = {}
                     for fd in findings:
                         sev_counts[fd["severity"]] = sev_counts.get(fd["severity"], 0) + 1
 
-                    layer_short = str(layer_key)[:16] if layer_key != "unknown" else "unknown"
+                    layer_short = layer_id[:20] if layer_id != "unknown" else "unknown"
                     f.write(f"### Layer #{idx + 1} — `{layer_short}`\n\n")
                     if instruction:
-                        f.write(f"**Instruction:** `{instruction[:150]}`\n\n")
+                        f.write(f"**Instruction:** `{instruction[:200]}`\n\n")
                     f.write(f"**Findings:** {len(findings)} — " + " | ".join(
                         f"{EMOJI.get(s, '')} {s}: {sev_counts[s]}"
                         for s in SEVERITY_ORDER if sev_counts.get(s)
@@ -441,20 +491,16 @@ def print_layer_report(json_path="image-layers.json"):
                     seen = set()
                     deduped = []
                     for fd in findings:
-                        key = (fd["component"], fd["cve"])
-                        if key not in seen:
-                            seen.add(key)
+                        k = (fd["component"], fd["cve"])
+                        if k not in seen:
+                            seen.add(k)
                             deduped.append(fd)
                     top = deduped[:5]
 
                     md_rows = [
-                        [
-                            fd["cve"],
-                            f"{EMOJI.get(fd['severity'], '')} {fd['severity']}",
-                            fd["component"],
-                            fd["version"],
-                            fd["fixed"],
-                        ]
+                        [fd["cve"],
+                         f"{EMOJI.get(fd['severity'], '')} {fd['severity']}",
+                         fd["component"], fd["version"], fd["fixed"]]
                         for fd in top
                     ]
                     f.write(tabulate(
@@ -469,6 +515,9 @@ def print_layer_report(json_path="image-layers.json"):
     except Exception as e:
         print(f"\n(Per-layer report failed: {e})")
         print(traceback.format_exc())
+
+
+
 
 
 def main():

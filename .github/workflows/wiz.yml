@@ -106,6 +106,32 @@ jobs:
           echo "::endgroup::"
         continue-on-error: true
 
+      - name: Inspect wizcli output structure
+        if: always()
+        run: |
+          echo "::group::📄 image-layers.json structure"
+          python3 -c "
+          import json
+          with open('image-layers.json') as f:
+              data = json.load(f)
+          result = data.get('result', {})
+          print('result keys:', list(result.keys()))
+          for key in ['osPackages', 'libraries', 'applications', 'secrets']:
+              items = result.get(key, [])
+              if items:
+                  print(f'{key}: {len(items)} items')
+                  sample = items[0]
+                  print(f'  sample keys: {list(sample.keys())}')
+                  vulns = sample.get('vulnerabilities', [])
+                  if vulns:
+                      print(f'  vuln sample keys: {list(vulns[0].keys())}')
+          " 2>/dev/null || echo "python inspect failed"
+          echo "::endgroup::"
+      
+          echo "::group::📄 image.txt first 100 lines"
+          head -100 image.txt 2>/dev/null || echo "no image.txt"
+          echo "::endgroup::"
+       
       # === Enrich SARIF + print clean summary table + per-layer report ===
       - name: Enrich and Display Summary
         if: always()

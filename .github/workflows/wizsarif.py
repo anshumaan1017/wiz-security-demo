@@ -219,17 +219,19 @@ def rewrite_alert_titles(sarif, scan_label):
 
 
 # ========================================================================
-# FIX #5 (REVISED): Normalize image SARIF locations AND add partial
-# fingerprints. GitHub Code Scanning rejects SARIFs where many results
-# collapse to the same (uri, line) — fingerprint generation fails and
-# the analysis is rejected during processing.
+# FIX #5: Normalize image SARIF locations. GitHub Code Scanning rejects
+# SARIFs where artifactLocation.uri points to docker image references,
+# AND where many results collapse to the same (uri, line) because
+# GitHub's fingerprint generation produces duplicates.
 #
 # We solve this by:
 #  1. Rewriting docker URIs → "Dockerfile" (repo-relative path)
 #  2. Spreading startLine values so each (ruleId, component, version)
-#     combination gets a unique synthetic line number (cycling through
-#     a range to keep them visually clustered in the Dockerfile view)
-#  3. Pre-computing partialFingerprints so GitHub doesn't have to guess
+#     combination gets a unique synthetic line number
+#
+# IMPORTANT: We do NOT pre-compute partialFingerprints. GitHub calculates
+# its own from (file content, line) and rejects SARIFs with mismatched
+# pre-computed values. Let GitHub auto-generate them.
 # ========================================================================
 import hashlib
 
@@ -317,13 +319,12 @@ def normalize_image_locations(sarif, target_path="Dockerfile", max_line=1000):
                         "endLine": synthetic_line,
                     }
 
-            # CRITICAL: Pre-compute partialFingerprints so GitHub doesn't
-            # auto-generate (which is failing at scale for image scans).
-            # primaryLocationLineHash is the fingerprint GitHub uses most.
-            result["partialFingerprints"] = {
-                "primaryLocationLineHash": fp_hash[:16],
-                "wizFingerprint/v1": fp_hash,
-            }
+            # Use synthetic startLine for uniqueness across results.
+            # DO NOT pre-compute partialFingerprints — GitHub calculates
+            # its own fingerprint from (file, line) and rejects SARIFs
+            # with mismatched pre-computed fingerprints. See warning:
+            # "Calculated fingerprint X:1 for file Dockerfile line 2,
+            #  but found existing inconsistent fingerprint value Y"
 
     return sarif
 

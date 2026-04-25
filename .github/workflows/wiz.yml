@@ -197,6 +197,22 @@ jobs:
           name: filter-dryrun
           path: filter_dryrun.json
           retention-days: 7
+
+      # === Beautification preview — show 3 sample alerts before deploying ===
+      - name: Preview beautified alerts
+        if: always() && hashFiles('image-layers.json') != ''
+        run: |
+          echo "::group::🎨 Beautification Preview"
+          python .github/workflows/preview_alerts.py
+          echo "::endgroup::"
+
+      - name: Upload beautification preview artifact
+        if: always() && hashFiles('preview_sample_alerts.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: beautification-preview
+          path: preview_sample_alerts.md
+          retention-days: 7
       # === Enrich SARIF + print clean summary table + per-layer report ===
       - name: Enrich and Display Summary
         if: always()

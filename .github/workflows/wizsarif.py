@@ -319,6 +319,330 @@ def build_policy_attribution_map(json_path):
     return attribution, stats
 
 
+# ========================================================================
+# BEAUTIFICATION: Functions to enrich SARIF results with rich titles,
+# remediation guidance, layer info, threat metadata, and references.
+# ========================================================================
+
+def build_vuln_metadata_map(json_path):
+    """
+    Build a map of (cve, comp_name, comp_ver) -> full vuln + package data.
+    Used for beautifying SARIF results with rich metadata.
+    """
+    if not os.path.exists(json_path):
+        return None, None
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+    except Exception:
+        return None, None
+
+    metadata = {}
+    scan_report_url = data.get("reportUrl")
+
+    result = data.get("result") or {}
+    for source_key in ["osPackages", "libraries", "applications"]:
+        for pkg in result.get(source_key, []) or []:
+            pkg_name = (pkg.get("name") or "").strip().lower()
+            pkg_ver = (pkg.get("version") or "").strip()
+            for vuln in pkg.get("vulnerabilities", []) or []:
+                cve = (vuln.get("name") or "").strip()
+                if not cve:
+                    continue
+                key = (cve, pkg_name, pkg_ver)
+                metadata[key] = {"vuln": vuln, "pkg": pkg}
+
+    return metadata, scan_report_url
+
+
+def _severity_emoji(sev):
+    return {
+        "CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡",
+        "LOW": "🟢", "INFORMATIONAL": "⚪",
+    }.get((sev or "").upper(), "⚫")
+
+
+def _format_alert_title(vuln, pkg):
+    """Build rich title: 'CVE-XXX: <comp> <ver> → <fixed_ver> [(modifier)]'"""
+    cve = vuln.get("name") or "UNKNOWN-CVE"
+    comp = pkg.get("name") or "unknown-component"
+    ver = pkg.get("version") or ""
+    fixed = vuln.get("fixedVersion")
+    has_kev = bool(vuln.get("hasCisaKevExploit"))
+
+    ver_short = ver[:50] + "…" if len(ver) > 50 else ver
+
+    if fixed:
+        core = f"{cve}: {comp} {ver_short} → {fixed}"
+    else:
+        core = f"{cve}: {comp} {ver_short} (no fix available)"
+
+    if has_kev:
+        return f"🚨 {core} (CISA KEV)"
+    return core
+
+
+def _truncate_description(desc, max_len=400):
+    if not desc:
+        return "_No description provided._"
+    if len(desc) <= max_len:
+        return desc
+    truncated = desc[:max_len]
+    last_period = truncated.rfind(". ")
+    if last_period > max_len * 0.7:
+        truncated = truncated[:last_period + 1]
+    return truncated + " _[…truncated. See source for full description.]_"
+
+
+def _format_remediation(vuln, pkg):
+    comp = pkg.get("name") or "unknown"
+    ver = pkg.get("version") or "unknown"
+    fixed = vuln.get("fixedVersion")
+    detection = (pkg.get("detectionMethod") or "").upper()
+
+    if not fixed:
+        return (
+            f"**Component:** `{comp}`\n"
+            f"**Current version:** `{ver}`\n"
+            f"**Status:** ⚠️ No fix currently available from upstream\n\n"
+            f"Mitigations to consider:\n"
+            f"- Apply compensating controls (network restrictions, runtime monitoring)\n"
+            f"- Track upstream for fix availability\n"
+            f"- Consider replacing the dependency if no fix is forthcoming"
+        )
+
+    if "DEBIAN" in detection or "APT" in detection or detection == "PACKAGE":
+        install_cmd = (
+            f"```dockerfile\n"
+            f"RUN apt-get update && apt-get install -y --only-upgrade {comp}\n"
+            f"```"
+        )
+    elif "ALPINE" in detection or "APK" in detection:
+        install_cmd = (
+            f"```dockerfile\n"
+            f"RUN apk add --no-cache {comp}={fixed}\n"
+            f"```"
+        )
+    elif "NPM" in detection or "JAVASCRIPT" in detection:
+        install_cmd = f"```bash\nnpm install {comp}@{fixed}\n```"
+    elif "PYPI" in detection or "PYTHON" in detection:
+        install_cmd = f"```bash\npip install --upgrade {comp}=={fixed}\n```"
+    else:
+        install_cmd = f"_Update `{comp}` to version `{fixed}` or later via your package manager._"
+
+    return (
+        f"**Component:** `{comp}`\n"
+        f"**Current version:** `{ver}`\n"
+        f"**Fixed in:** `{fixed}` or later\n\n"
+        f"**How to fix:**\n\n{install_cmd}"
+    )
+
+
+def _format_layer_info(pkg):
+    layer = pkg.get("layerMetadata") or {}
+    if not layer:
+        return None
+    layer_id = layer.get("id") or "unknown"
+    is_base = bool(layer.get("isBaseLayer"))
+    instruction = (
+        layer.get("details") or layer.get("createdBy")
+        or layer.get("instruction") or ""
+    )
+    base_tag = " 📦 (Base image layer)" if is_base else ""
+    if instruction and len(instruction) > 300:
+        instruction = instruction[:300] + " ..."
+    out = f"**Layer:**{base_tag}\n\n"
+    if instruction:
+        out += f"```\n{instruction}\n```\n\n"
+    out += f"**Layer digest:** `{layer_id}`"
+    return out
+
+
+def _format_threat_metadata(vuln):
+    rows = []
+    if vuln.get("score") is not None:
+        rows.append(("CVSS Score", f"{vuln['score']} ({(vuln.get('severity') or '').title()})"))
+    if vuln.get("epssProbability") is not None:
+        epss = vuln["epssProbability"]
+        rows.append(("EPSS Probability", f"{epss * 100:.2f}%" if epss < 1 else f"{epss:.2f}%"))
+    if vuln.get("epssPercentile") is not None:
+        rows.append(("EPSS Percentile", f"{vuln['epssPercentile']:.1f}%"))
+    has_exploit = vuln.get("hasExploit")
+    if has_exploit is not None:
+        rows.append(("Public Exploit", "🔥 Yes" if has_exploit else "No"))
+    has_kev = vuln.get("hasCisaKevExploit")
+    if has_kev is not None:
+        rows.append(("CISA KEV Listed", "🚨 Yes" if has_kev else "No"))
+    pub = vuln.get("publishDate")
+    if pub:
+        rows.append(("CVE Published", pub.split("T")[0]))
+    fix_pub = vuln.get("fixPublishDate")
+    if fix_pub:
+        rows.append(("Fix Published", fix_pub.split("T")[0]))
+
+    if not rows:
+        return "_No threat metadata available._"
+    md = "| Indicator | Value |\n|---|---|\n"
+    for k, v in rows:
+        md += f"| {k} | {v} |\n"
+    return md
+
+
+def _format_references(vuln, scan_report_url):
+    refs = []
+    if scan_report_url:
+        refs.append(f"- 🔗 [View this scan in Wiz Console]({scan_report_url})")
+    source = vuln.get("source")
+    if source:
+        refs.append(f"- 📋 [Source Advisory]({source})")
+    cve = vuln.get("name", "")
+    if cve.startswith("CVE-"):
+        refs.append(f"- 🔍 [NVD Entry](https://nvd.nist.gov/vuln/detail/{cve})")
+    if not refs:
+        return "_No references available._"
+    return "\n".join(refs)
+
+
+def _format_alert_markdown(vuln, pkg, scan_report_url):
+    """Build the full markdown body for the alert detail page."""
+    sev = (vuln.get("severity") or "").upper()
+    sev_em = _severity_emoji(sev)
+    score = vuln.get("score")
+    layer = pkg.get("layerMetadata") or {}
+    is_base = bool(layer.get("isBaseLayer"))
+
+    parts = [f"**Severity:** {sev_em} {sev.title()}"]
+    if score is not None:
+        parts[0] += f" (CVSS {score})"
+    if vuln.get("fixedVersion"):
+        parts.append("**Fix available:** Yes")
+    else:
+        parts.append("**Fix available:** No")
+    if is_base:
+        parts.append("**Base image layer:** Yes")
+
+    header = " · ".join(parts)
+    description = _truncate_description(vuln.get("description"))
+    remediation = _format_remediation(vuln, pkg)
+    layer_info = _format_layer_info(pkg)
+    threat = _format_threat_metadata(vuln)
+    refs = _format_references(vuln, scan_report_url)
+
+    md = f"{header}\n\n"
+    md += f"## Description\n\n{description}\n\n"
+    md += f"## 🔧 Remediation\n\n{remediation}\n\n"
+    if layer_info:
+        md += f"## 📦 Introduced In\n\n{layer_info}\n\n"
+    md += f"## Threat Metadata\n\n{threat}\n\n"
+    md += f"## References\n\n{refs}\n"
+    return md
+
+
+def _build_rule_tags(vuln):
+    tags = ["security", "vulnerability"]
+    sev = (vuln.get("severity") or "").lower()
+    if sev:
+        tags.append(sev)
+    if vuln.get("hasExploit"):
+        tags.append("has-exploit")
+    if vuln.get("hasCisaKevExploit"):
+        tags.append("cisa-kev")
+    if not vuln.get("fixedVersion"):
+        tags.append("no-fix")
+    return tags
+
+
+def beautify_image_sarif(sarif, vuln_metadata_map, scan_report_url):
+    """
+    Apply rich beautification to image SARIF: titles, markdown bodies,
+    rule tags, helpUri. Falls back gracefully when metadata is missing.
+    """
+    if not vuln_metadata_map:
+        print(f"  ⚠️  No vuln metadata map — skipping beautification")
+        return sarif
+
+    # Build a CVE -> rule index for updating rule metadata
+    rules_by_id = {}
+    for run in sarif.get("runs", []):
+        for rule in run.get("tool", {}).get("driver", {}).get("rules", []) or []:
+            rid = rule.get("id")
+            if rid:
+                rules_by_id[rid] = rule
+
+    beautified_count = 0
+    skipped_count = 0
+    rule_updates = {}  # rule_id -> {tags, helpUri, fullDescription}
+
+    for run in sarif.get("runs", []):
+        for result in run.get("results", []):
+            cve = (result.get("ruleId") or "").strip()
+            msg_text = (result.get("message") or {}).get("text", "") or ""
+            fields = parse_message_text(msg_text)
+            comp_name = (fields.get("component") or "").strip().lower()
+            comp_ver = (fields.get("version") or "").strip()
+
+            key = (cve, comp_name, comp_ver)
+            meta = vuln_metadata_map.get(key)
+            if not meta:
+                skipped_count += 1
+                continue
+
+            vuln = meta["vuln"]
+            pkg = meta["pkg"]
+
+            # Build title and markdown
+            title = _format_alert_title(vuln, pkg)
+            markdown = _format_alert_markdown(vuln, pkg, scan_report_url)
+
+            # Update result.message — text gets the title (used in alert lists),
+            # markdown gets the rich body (used in alert detail page)
+            result["message"] = {
+                "text": title,
+                "markdown": markdown,
+            }
+
+            # Track rule-level updates (do them after, to avoid duplicates)
+            if cve and cve not in rule_updates:
+                rule_updates[cve] = {
+                    "tags": _build_rule_tags(vuln),
+                    "helpUri": vuln.get("source") or "",
+                    "shortDescription": title,
+                    "fullDescription": _truncate_description(
+                        vuln.get("description"), max_len=600
+                    ),
+                }
+
+            beautified_count += 1
+
+    # Apply rule-level updates
+    for rid, updates in rule_updates.items():
+        rule = rules_by_id.get(rid)
+        if not rule:
+            continue
+        # Merge tags into existing tags
+        props = rule.setdefault("properties", {})
+        existing_tags = set(props.get("tags", []) or [])
+        existing_tags.update(updates["tags"])
+        props["tags"] = sorted(existing_tags)
+        # Set helpUri only if we have one (and no existing one)
+        if updates["helpUri"] and not rule.get("helpUri"):
+            rule["helpUri"] = updates["helpUri"]
+        # Update shortDescription with our rich title
+        if updates["shortDescription"]:
+            rule["shortDescription"] = {"text": updates["shortDescription"]}
+        # Update fullDescription
+        if updates["fullDescription"]:
+            rule["fullDescription"] = {"text": updates["fullDescription"]}
+
+    print(f"\n  ✨ BEAUTIFICATION APPLIED")
+    print(f"     Beautified results:  {beautified_count}")
+    print(f"     Beautified rules:    {len(rule_updates)}")
+    if skipped_count:
+        print(f"     Skipped (no JSON match): {skipped_count}")
+
+    return sarif
+
+
 def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
     """
     Filter SARIF results based on Wiz policy attribution.
@@ -958,10 +1282,14 @@ def main():
             # 2. Filter by Wiz policy attribution (image SARIF only)
             #    Reads image-layers.json to determine which findings are
             #    Failed / Ignored / Below Threshold per the Wiz policy
+            vuln_metadata_map = None
+            scan_report_url = None
             if "image" in path.lower():
                 attribution_map, stats = build_policy_attribution_map("image-layers.json")
                 if attribution_map is not None:
                     sarif = filter_sarif_by_wiz_policy(sarif, attribution_map, stats)
+                # Also load full vuln metadata for beautification
+                vuln_metadata_map, scan_report_url = build_vuln_metadata_map("image-layers.json")
 
             # 3. Normalize image locations (THE FIX for wiz-image failure)
             # GitHub rejects SARIFs whose artifactLocation.uri points to
@@ -972,11 +1300,16 @@ def main():
             # 4. Enrich: add security-severity to each rule
             sarif = enrich_sarif_with_severity(sarif)
 
-            # 5. Rewrite titles (markdown-only — text preserved)
+            # 5. Beautify (image SARIF) OR rewrite titles (other SARIFs)
+            #    Image SARIF gets full beautification: rich titles + markdown
+            #    body + tags + helpUri. SCA/IaC keep the simpler title format.
             scan_label = "SCA" if "dir" in path else (
                 "IaC" if "dockerfile" in path else "Image"
             )
-            sarif = rewrite_alert_titles(sarif, scan_label)
+            if scan_label == "Image" and vuln_metadata_map:
+                sarif = beautify_image_sarif(sarif, vuln_metadata_map, scan_report_url)
+            else:
+                sarif = rewrite_alert_titles(sarif, scan_label)
 
             # 6. Cap results with strict rule-result consistency
             if "image" in path.lower():

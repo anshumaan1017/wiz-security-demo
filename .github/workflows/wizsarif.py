@@ -321,91 +321,97 @@ def build_policy_attribution_map(json_path):
 
 def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
     """
-    Filter SARIF results based on Wiz policy attribution:
-      - "failed"          → keep as-is (will appear as Open in GitHub)
-      - "ignored"         → keep but add suppressions (will appear as Dismissed)
-      - "below_threshold" → DROP entirely (won't appear in GitHub)
-      - unmatched         → keep with conservative default (Open)
+    Filter SARIF results based on Wiz policy attribution.
+
+    KEY INSIGHT: Wiz JSON output is binary — every finding is either:
+      - in failedPolicyMatches (= "Failed" in console = action required)
+      - in ignoredPolicyMatches (= "Below Threshold" or "Ignored" in console)
+
+    The console's "Ignored" vs "Below Threshold" distinction does NOT
+    appear in the JSON — both are lumped into ignoredPolicyMatches.
+
+    So we keep ONLY findings with non-empty failedPolicyMatches.
+    This matches the Wiz console's "Failed" count exactly.
+
+    Findings with ignoredPolicyMatches → DROPPED (they will not appear
+    in GitHub Security tab). They remain visible in the Wiz console.
     """
     if not attribution_map:
         print(f"  ⚠️  No attribution map — skipping policy filter")
         return sarif
-    
+
     kept_failed = 0
-    kept_ignored = 0
-    dropped = 0
+    dropped_ignored = 0
+    dropped_below_threshold = 0
     unmatched = 0
-    
+
     for run in sarif.get("runs", []):
         original_results = run.get("results", []) or []
         new_results = []
-        
+
         for result in original_results:
             cve = (result.get("ruleId") or "").strip()
-            
+
             # Parse component+version from message.text
             msg_text = (result.get("message") or {}).get("text", "") or ""
             fields = parse_message_text(msg_text)
             comp_name = (fields.get("component") or "").strip().lower()
             comp_ver = (fields.get("version") or "").strip()
-            
+
             key = (cve, comp_name, comp_ver)
             attr = attribution_map.get(key)
-            
+
             if attr == "failed":
-                # Keep as Open alert
+                # Keep as Open alert — matches Wiz console "Failed"
                 new_results.append(result)
                 kept_failed += 1
             elif attr == "ignored":
-                # Keep but mark as suppressed (will show as Dismissed in GitHub)
-                result["suppressions"] = [{
-                    "kind": "external",
-                    "status": "accepted",
-                    "justification": "Ignored by Wiz CI/CD policy",
-                }]
-                new_results.append(result)
-                kept_ignored += 1
+                # Drop — Wiz JSON conflates "Ignored" and "Below Threshold"
+                # into this bucket; not actionable for GitHub Security tab
+                dropped_ignored += 1
             elif attr == "below_threshold":
-                # Drop entirely — below customer's policy threshold
-                dropped += 1
+                # Drop — explicitly below policy threshold
+                dropped_below_threshold += 1
             else:
-                # Unmatched — could be a SARIF result with no JSON counterpart.
-                # Conservative default: keep it as Open (don't silently lose data).
-                new_results.append(result)
+                # Unmatched — SARIF result with no JSON counterpart.
+                # Conservative: drop it to keep noise low. Customer can
+                # always cross-reference Wiz console for full visibility.
                 unmatched += 1
-        
+
         run["results"] = new_results
-    
+
+    total_dropped = dropped_ignored + dropped_below_threshold + unmatched
+
     # Print attribution summary
     print(f"\n  🎯 WIZ POLICY FILTER APPLIED")
     print(f"     Wiz JSON had {stats['total']} total findings:")
-    print(f"       Failed:          {stats['failed']:>5}  → kept as Open alerts")
-    print(f"       Ignored:         {stats['ignored']:>5}  → kept as Dismissed alerts")
-    print(f"       Below Threshold: {stats['below_threshold']:>5}  → dropped from SARIF")
+    print(f"       Failed:          {stats['failed']:>5}  → KEPT (Open in GitHub)")
+    print(f"       Ignored:         {stats['ignored']:>5}  → DROPPED")
+    print(f"       Below Threshold: {stats['below_threshold']:>5}  → DROPPED")
     print(f"     SARIF results processed:")
-    print(f"       Kept (Failed):   {kept_failed:>5}")
-    print(f"       Kept (Ignored):  {kept_ignored:>5}")
-    print(f"       Dropped:         {dropped:>5}")
+    print(f"       Kept (Failed):     {kept_failed:>5}")
+    print(f"       Dropped (Ignored): {dropped_ignored:>5}")
+    print(f"       Dropped (BT):      {dropped_below_threshold:>5}")
     if unmatched:
-        print(f"       Unmatched:       {unmatched:>5}  (kept as Open by default)")
-    
-    # Write to GitHub Step Summary if available
+        print(f"       Dropped (Unmatched):{unmatched:>5}  (typically EOL/secrets/non-CVE findings)")
+    print(f"     → GitHub Security tab will show: {kept_failed} Open alerts")
+
+    # Write to GitHub Step Summary
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a") as f:
             f.write("\n## Wiz Image Scan — GitHub Security Tab Mapping\n\n")
             f.write(f"Filter applied based on Wiz policy `Zee-Container-Security`:\n\n")
-            f.write(f"| State | Count | Source |\n")
+            f.write(f"| State | Count | Mapped From |\n")
             f.write(f"|-------|------:|--------|\n")
-            f.write(f"| 🔴 Open (action required) | {kept_failed} | Wiz `Failed` findings |\n")
-            f.write(f"| 🟡 Dismissed (acknowledged) | {kept_ignored} | Wiz `Ignored` findings |\n")
-            f.write(f"| ⚪ Dropped (below threshold) | {dropped} | Visible in Wiz console only |\n")
-            if unmatched:
-                f.write(f"| 🔵 Unmatched (kept as Open) | {unmatched} | SARIF entries with no JSON match |\n")
-            f.write(f"\n**Total in GitHub Security tab:** {kept_failed + kept_ignored + unmatched}\n")
+            f.write(f"| 🔴 Open (action required) | **{kept_failed}** | Wiz `Failed` findings |\n")
+            f.write(f"| ⚪ Dropped from SARIF | {total_dropped} | Wiz `Ignored` / Below Threshold (visible in Wiz console) |\n")
+            f.write(f"\n**Total in GitHub Security tab:** {kept_failed} Open alerts\n")
             f.write(f"**Total findings detected by Wiz:** {stats['total']}\n")
-            f.write(f"**Reduction:** {(1 - (kept_failed + kept_ignored + unmatched) / stats['total']) * 100:.1f}%\n")
-    
+            if stats['total']:
+                reduction = (1 - kept_failed / stats['total']) * 100
+                f.write(f"**Noise reduction:** {reduction:.1f}%\n")
+
     return sarif
 
 

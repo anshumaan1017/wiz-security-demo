@@ -21,7 +21,7 @@
 # Run the application
 # CMD ["python3", "-c", "print('wiz-vuln-demo minimal')"]
 
-# Customer's Dockerfile — node:18-bullseye for Wiz vs Prisma comparison
+# Dockerfile — node:18-bullseye
 FROM node:18-bullseye
 WORKDIR /app
 COPY package*.json ./

@@ -1,0 +1,6 @@
+{
+  "name": "wiz-customer-test",
+  "version": "1.0.0",
+  "description": "Replicating customer image for Wiz vs Prisma comparison",
+  "dependencies": {}
+}

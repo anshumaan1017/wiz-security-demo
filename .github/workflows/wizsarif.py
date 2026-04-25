@@ -248,6 +248,167 @@ def _parse_msg_fields(text):
     return fields
 
 
+# ========================================================================
+# FIX #6: Filter image SARIF based on Wiz policy attribution.
+# 
+# Wiz CLI's image scan JSON output (image-layers.json) tags each finding
+# with policy attribution via two fields:
+#   - failedPolicyMatches: non-empty → finding FAILED the policy (must fix)
+#   - ignoredPolicyMatches: non-empty → finding was IGNORED by policy
+#   - both None → finding is BELOW THRESHOLD (not relevant)
+#
+# We use this attribution to filter image.sarif so GitHub Security tab
+# matches Wiz console's view exactly:
+#   - Failed findings → Open alerts in GitHub (level: error)
+#   - Ignored findings → Closed alerts in GitHub (with suppressions field)
+#   - Below threshold findings → DROPPED (not in SARIF at all)
+#
+# Matching SARIF results to JSON findings is done by parsing
+# (CVE name, component name, component version) from message.text since
+# SARIF and JSON don't share IDs.
+# ========================================================================
+
+def build_policy_attribution_map(json_path):
+    """
+    Read image-layers.json and build a map of:
+      (cve_name, component_name, component_version) -> "failed" / "ignored" / None
+    
+    Returns the map plus stats for reporting.
+    """
+    if not os.path.exists(json_path):
+        print(f"  ⚠️  {json_path} not found — cannot apply Wiz policy filter")
+        return None, None
+    
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"  ⚠️  Could not parse {json_path}: {e}")
+        return None, None
+    
+    result = data.get("result") or {}
+    attribution = {}
+    stats = {"failed": 0, "ignored": 0, "below_threshold": 0, "total": 0}
+    
+    for source_key in ["osPackages", "libraries", "applications"]:
+        for pkg in result.get(source_key, []) or []:
+            pkg_name = (pkg.get("name") or "").strip().lower()
+            pkg_ver = (pkg.get("version") or "").strip()
+            
+            for vuln in pkg.get("vulnerabilities", []) or []:
+                cve = (vuln.get("name") or "").strip()
+                if not cve:
+                    continue
+                
+                key = (cve, pkg_name, pkg_ver)
+                stats["total"] += 1
+                
+                failed = vuln.get("failedPolicyMatches")
+                ignored = vuln.get("ignoredPolicyMatches")
+                
+                if failed:
+                    attribution[key] = "failed"
+                    stats["failed"] += 1
+                elif ignored:
+                    attribution[key] = "ignored"
+                    stats["ignored"] += 1
+                else:
+                    attribution[key] = "below_threshold"
+                    stats["below_threshold"] += 1
+    
+    return attribution, stats
+
+
+def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
+    """
+    Filter SARIF results based on Wiz policy attribution:
+      - "failed"          → keep as-is (will appear as Open in GitHub)
+      - "ignored"         → keep but add suppressions (will appear as Dismissed)
+      - "below_threshold" → DROP entirely (won't appear in GitHub)
+      - unmatched         → keep with conservative default (Open)
+    """
+    if not attribution_map:
+        print(f"  ⚠️  No attribution map — skipping policy filter")
+        return sarif
+    
+    kept_failed = 0
+    kept_ignored = 0
+    dropped = 0
+    unmatched = 0
+    
+    for run in sarif.get("runs", []):
+        original_results = run.get("results", []) or []
+        new_results = []
+        
+        for result in original_results:
+            cve = (result.get("ruleId") or "").strip()
+            
+            # Parse component+version from message.text
+            msg_text = (result.get("message") or {}).get("text", "") or ""
+            fields = parse_message_text(msg_text)
+            comp_name = (fields.get("component") or "").strip().lower()
+            comp_ver = (fields.get("version") or "").strip()
+            
+            key = (cve, comp_name, comp_ver)
+            attr = attribution_map.get(key)
+            
+            if attr == "failed":
+                # Keep as Open alert
+                new_results.append(result)
+                kept_failed += 1
+            elif attr == "ignored":
+                # Keep but mark as suppressed (will show as Dismissed in GitHub)
+                result["suppressions"] = [{
+                    "kind": "external",
+                    "status": "accepted",
+                    "justification": "Ignored by Wiz CI/CD policy",
+                }]
+                new_results.append(result)
+                kept_ignored += 1
+            elif attr == "below_threshold":
+                # Drop entirely — below customer's policy threshold
+                dropped += 1
+            else:
+                # Unmatched — could be a SARIF result with no JSON counterpart.
+                # Conservative default: keep it as Open (don't silently lose data).
+                new_results.append(result)
+                unmatched += 1
+        
+        run["results"] = new_results
+    
+    # Print attribution summary
+    print(f"\n  🎯 WIZ POLICY FILTER APPLIED")
+    print(f"     Wiz JSON had {stats['total']} total findings:")
+    print(f"       Failed:          {stats['failed']:>5}  → kept as Open alerts")
+    print(f"       Ignored:         {stats['ignored']:>5}  → kept as Dismissed alerts")
+    print(f"       Below Threshold: {stats['below_threshold']:>5}  → dropped from SARIF")
+    print(f"     SARIF results processed:")
+    print(f"       Kept (Failed):   {kept_failed:>5}")
+    print(f"       Kept (Ignored):  {kept_ignored:>5}")
+    print(f"       Dropped:         {dropped:>5}")
+    if unmatched:
+        print(f"       Unmatched:       {unmatched:>5}  (kept as Open by default)")
+    
+    # Write to GitHub Step Summary if available
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a") as f:
+            f.write("\n## Wiz Image Scan — GitHub Security Tab Mapping\n\n")
+            f.write(f"Filter applied based on Wiz policy `Zee-Container-Security`:\n\n")
+            f.write(f"| State | Count | Source |\n")
+            f.write(f"|-------|------:|--------|\n")
+            f.write(f"| 🔴 Open (action required) | {kept_failed} | Wiz `Failed` findings |\n")
+            f.write(f"| 🟡 Dismissed (acknowledged) | {kept_ignored} | Wiz `Ignored` findings |\n")
+            f.write(f"| ⚪ Dropped (below threshold) | {dropped} | Visible in Wiz console only |\n")
+            if unmatched:
+                f.write(f"| 🔵 Unmatched (kept as Open) | {unmatched} | SARIF entries with no JSON match |\n")
+            f.write(f"\n**Total in GitHub Security tab:** {kept_failed + kept_ignored + unmatched}\n")
+            f.write(f"**Total findings detected by Wiz:** {stats['total']}\n")
+            f.write(f"**Reduction:** {(1 - (kept_failed + kept_ignored + unmatched) / stats['total']) * 100:.1f}%\n")
+    
+    return sarif
+
+
 def normalize_image_locations(sarif, target_path="Dockerfile", max_line=1000):
     """
     Rewrite artifactLocation.uri to a repo-relative path, give each result
@@ -788,28 +949,36 @@ def main():
             # 1. Ensure tool metadata (fixes "version: unknown" warning)
             sarif = ensure_tool_metadata(sarif)
 
-            # 2. Normalize image locations (THE FIX for wiz-image failure)
+            # 2. Filter by Wiz policy attribution (image SARIF only)
+            #    Reads image-layers.json to determine which findings are
+            #    Failed / Ignored / Below Threshold per the Wiz policy
+            if "image" in path.lower():
+                attribution_map, stats = build_policy_attribution_map("image-layers.json")
+                if attribution_map is not None:
+                    sarif = filter_sarif_by_wiz_policy(sarif, attribution_map, stats)
+
+            # 3. Normalize image locations (THE FIX for wiz-image failure)
             # GitHub rejects SARIFs whose artifactLocation.uri points to
             # docker image references instead of repo-relative paths.
             if "image" in path.lower():
                 sarif = normalize_image_locations(sarif, target_path="Dockerfile")
 
-            # 3. Enrich: add security-severity to each rule
+            # 4. Enrich: add security-severity to each rule
             sarif = enrich_sarif_with_severity(sarif)
 
-            # 4. Rewrite titles (markdown-only — text preserved)
+            # 5. Rewrite titles (markdown-only — text preserved)
             scan_label = "SCA" if "dir" in path else (
                 "IaC" if "dockerfile" in path else "Image"
             )
             sarif = rewrite_alert_titles(sarif, scan_label)
 
-            # 5. Cap results with strict rule-result consistency
+            # 6. Cap results with strict rule-result consistency
             if "image" in path.lower():
                 sarif = cap_results(sarif, max_results=1000)
             else:
                 sarif = cap_results(sarif, max_results=5000)
 
-            # 6. Validate before writing
+            # 7. Validate before writing
             validate_sarif(sarif, path)
 
             with open(path, "w") as f:

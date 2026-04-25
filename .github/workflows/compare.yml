@@ -37,7 +37,7 @@ jobs:
             --output-file prisma_results.json --details \
             "$IMAGE_TAG" || true
 
-          python3 << 'PY' | tee /tmp/prisma_stats.txt
+          python3 << 'PY' | tee prisma_stats.txt
           import json
           d = json.load(open('prisma_results.json'))
           vulns = d.get('results',[{}])[0].get('vulnerabilities',[])
@@ -68,7 +68,7 @@ jobs:
 
           sudo chown runner:runner wiz_results.json 2>/dev/null || true
 
-          python3 << 'PY' | tee /tmp/wiz_stats.txt
+          python3 << 'PY' | tee wiz_stats.txt
           import json
           d = json.load(open('wiz_results.json'))
           result = d.get('result', {})
@@ -108,19 +108,19 @@ jobs:
         if: always()
         run: |
           P_TOTAL=0; P_CRIT=0; P_HIGH=0; P_MED=0; P_LOW=0
-          [ -f /tmp/prisma_stats.txt ] && while IFS='=' read -r k v; do
+          [ -f prisma_stats.txt ] && while IFS='=' read -r k v; do
             case "$k" in TOTAL) P_TOTAL=$v;; CRITICAL) P_CRIT=$v;; HIGH) P_HIGH=$v;; MEDIUM) P_MED=$v;; LOW) P_LOW=$v;; esac
-          done < /tmp/prisma_stats.txt
+          done < prisma_stats.txt
 
           W_TOTAL=0; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0
           W_RAW=0; W_CSLIB=0; W_CSLIB_EXP=0; W_CSLIB_EXP_FIX=0; W_OS=0; W_LIB=0
-          [ -f /tmp/wiz_stats.txt ] && while IFS='=' read -r k v; do
+          [ -f wiz_stats.txt ] && while IFS='=' read -r k v; do
             case "$k" in
               TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;;
               RAW_ALL) W_RAW=$v;; CS_LIB) W_CSLIB=$v;; CS_LIB_EXPLOIT) W_CSLIB_EXP=$v;;
               CS_LIB_EXPLOIT_FIX) W_CSLIB_EXP_FIX=$v;; OS_PKG) W_OS=$v;; LIB_PKG) W_LIB=$v;;
             esac
-          done < /tmp/wiz_stats.txt
+          done < wiz_stats.txt
 
           REMOVED=$((W_RAW - W_TOTAL))
           PCT=$(python3 -c "print(f'{100*${REMOVED}/${W_RAW}:.1f}')" 2>/dev/null || echo "n/a")
@@ -166,3 +166,5 @@ jobs:
           path: |
             prisma_results.json
             wiz_results.json
+            prisma_stats.txt
+            wiz_stats.txt
